@@ -2,7 +2,9 @@
 
 from collections.abc import Callable
 
-from assistant.infra.erp_client import ErpClient
+from assistant.graphrag.search import global_search, local_search
+from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected
+from assistant.infra.grounding import code_type, normalize_code
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import KnowledgeBase
 
@@ -108,6 +110,49 @@ TOOL_SCHEMAS: list[dict] = [
 ]
 
 
+class _BadArgument(ValueError):
+    """Аргумент не прошёл проверку: инструмент не обращается ни к ERP, ни к модели."""
+
+
+def _warehouse(raw: object) -> str:
+    """Склад из закрытого списка; лишние пробелы значения не имеют."""
+    name = raw.strip() if isinstance(raw, str) else ""
+    if name not in WAREHOUSES:
+        raise _BadArgument(f"неизвестный склад {raw!r}, допустимы: {', '.join(WAREHOUSES)}")
+    return name
+
+
+def _part(raw: object) -> str:
+    """Канонический номер детали: P-1042, p 1042 или P-1042B. Модели и коды ошибок отклоняются."""
+    code = normalize_code(raw) if isinstance(raw, str) else None
+    if code is None or code_type(code) != "Part":
+        raise _BadArgument(f"{raw!r} не номер детали: нужен код вида P-1042 или P-1042B")
+    return code
+
+
+def _qty(raw: object) -> int:
+    """Положительное целое количество; bool и дробные числа количеством не считаются."""
+    value = int(raw.strip()) if isinstance(raw, str) and raw.strip().isdecimal() else raw
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise _BadArgument(f"количество {raw!r} должно быть целым числом больше нуля")
+    return value
+
+
+def _model(raw: object) -> str:
+    """Название модели оборудования, для которой заказывается деталь."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise _BadArgument("model должен быть названием модели оборудования, например AR-210")
+    return raw.strip()
+
+
+def _erp_call(method: Callable[..., dict], *args) -> dict:
+    """Вызов ERP: ожидаемые отказы становятся {"error"}, ErpUnavailable передаётся дальше."""
+    try:
+        return method(*args)
+    except (ErpNotFound, ErpRejected) as exc:
+        return {"error": str(exc)}
+
+
 def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, Callable[..., dict]]:
     """Словарь «имя инструмента -> функция». Каждая функция возвращает словарь.
 
@@ -116,5 +161,45 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
     `ErpNotFound` и `ErpRejected` превращаются в {"error": "..."} с разным текстом, чтобы исходы
     оставались различимыми. `ErpUnavailable` передаётся дальше: повторы делает агент (FR-8).
     """
-    # TODO: пять функций поверх local_search, global_search и клиента ERP
-    raise NotImplementedError("Реализуйте build_tools")
+
+    def search_knowledge(question: str) -> dict:
+        answer = local_search(question, kb, llm)
+        return {
+            "answer": answer.text,
+            "facts": list(answer.facts),
+            "sources": list(answer.sources),
+            "refused": answer.refused,
+        }
+
+    def summarize_topic(question: str) -> dict:
+        answer = global_search(question, kb, llm)
+        return {"answer": answer.text, "sources": list(answer.sources), "refused": answer.refused}
+
+    def check_stock(part_id: object, warehouse: object) -> dict:
+        try:
+            code, place = _part(part_id), _warehouse(warehouse)
+        except _BadArgument as exc:
+            return {"error": str(exc)}
+        return _erp_call(erp.get_stock, code, place)
+
+    def get_price(part_id: object) -> dict:
+        try:
+            code = _part(part_id)
+        except _BadArgument as exc:
+            return {"error": str(exc)}
+        return _erp_call(erp.get_price, code)
+
+    def create_service_order(part_id: object, warehouse: object, qty: object, model: object) -> dict:
+        try:
+            code, place, count, equipment = _part(part_id), _warehouse(warehouse), _qty(qty), _model(model)
+        except _BadArgument as exc:
+            return {"error": str(exc)}
+        return _erp_call(erp.create_order, code, place, count, equipment)
+
+    return {
+        "search_knowledge": search_knowledge,
+        "summarize_topic": summarize_topic,
+        "check_stock": check_stock,
+        "get_price": get_price,
+        "create_service_order": create_service_order,
+    }
