@@ -1,10 +1,11 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
 import json
-from assistant.infra.llm import LLMClient, LLMResponse, LLMError
+
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import find_codes, normalize_code, canonical_name, CODE_TYPES
-from assistant.infra.schemas import Chunk, ExtractionResult, EXTRACTION_SCHEMA, Entity, Relation, RELATION_SIGNATURES
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes, normalize_code
+from assistant.infra.llm import LLMClient, LLMError, LLMResponse
+from assistant.infra.schemas import EXTRACTION_SCHEMA, Chunk, Entity, ExtractionResult, Relation
 
 
 def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
@@ -41,7 +42,8 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
 
     SYSTEM_PROMPT = """Ты — система извлечения знаний для построения графа для компании, 
     которая производит и обслуживает холодильное оборудование для магазинов и складов. 
-    У неё три линейки: витрины «Арктика», моноблоки для холодильных камер «Бриз» и чиллеры «Гольфстрим», по четыре модели в каждой.
+    У неё три линейки: витрины «Арктика», моноблоки для холодильных камер «Бриз»
+    и чиллеры «Гольфстрим», по четыре модели в каждой.
     Извлеки из текста сущности и связи строго по схеме. Не выдумывай факты, которых нет в тексте.
     
     ### Типы сущностей
@@ -49,7 +51,10 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     
     ### Словарь названий
     "ProductLine": "Арктика", "Бриз", "Гольфстрим"
-    "Component": "компрессор", "вентилятор конденсатора", "датчик температуры", "контроллер", "реле давления", "пусковое реле", "вентилятор испарителя", "блок освещения", "нагреватель оттайки", "терморегулирующий вентиль", "циркуляционный насос", "реле протока"
+    "Component": "компрессор", "вентилятор конденсатора", "датчик температуры",
+    "контроллер", "реле давления", "пусковое реле", "вентилятор испарителя",
+    "блок освещения", "нагреватель оттайки", "терморегулирующий вентиль",
+    "циркуляционный насос", "реле протока"
     "Supplier": "АвтоматикаСевер", "ВентПром", "ГидроТех", "КомпрессорМаш", "ТермоПрибор", "ХолодКомплект"
    
      ### Префикс кода сущности -> (число цифр, тип сущности).
@@ -81,7 +86,8 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     ### Правила извлечения связей для графа
     1. Извлекай только то, что явно следует из текста.
     2. Не дублируй одинаковые сущности и одинаковые связи.
-    3. Связи между одинаковыми типами разрешены только для Part (REPLACED_BY), связи типа Model -> Model, Component -> Component запрещены.
+    3. Связи между одинаковыми типами разрешены только для Part (REPLACED_BY).
+       Связи типа Model -> Model, Component -> Component запрещены.
     4. Если в тексте перечислены узлы/детали для конкретной модели, то:
        - создается связь с КАЖДОЙ деталью через HAS_PART (Model -> Part)
        - каждая деталь связывается с компонентом через IS_A
@@ -92,7 +98,8 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     ***Важно: ответ должен представлять собой полностью валидный JSON***
 
     ### Примеры работы:
-    Текст: "Датчик температуры является одним из компонентов модели AR-310. При неисправности датчика назначается ошибка E-24."
+    Текст: "Датчик температуры является одним из компонентов модели AR-310.
+    При неисправности датчика назначается ошибка E-24."
     Ответ:
     {
       "entities": [
@@ -250,7 +257,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         except json.JSONDecodeError:
             continue
 
-        if not "entities" in content or not "relations" in content:
+        if "entities" not in content or "relations" not in content:
             continue
 
         raw_entities = content["entities"]
@@ -291,7 +298,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
                 dropped += 1
                 continue
 
-            if not (subj_resolved, rel_type, obj_resolved) in unique_relations:
+            if (subj_resolved, rel_type, obj_resolved) not in unique_relations:
                 unique_relations.add((subj_resolved, rel_type, obj_resolved))
 
                 rel = Relation(Entity(*subj_resolved), rel_type, Entity(*obj_resolved))
