@@ -9,6 +9,10 @@ from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
 
+MAX_REPLACEMENT_DEPTH = 5
+MAX_FACTS_CHARS = 8000
+REFUSAL_TEXT = "в базе знаний не найдено"
+
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Отвечает на вопрос о конкретных сущностях по фактам из графа.
@@ -52,19 +56,26 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                     if graph.has_edge(target, source):
                         selected_edges.add((target, source))
 
-        pending_parts = sorted(node for node in path_nodes if graph.nodes[node].get("type") == "Part")
-        visited_parts: set[str] = set()
-        while pending_parts:
-            part = pending_parts.pop(0)
-            if part in visited_parts:
+    pending_parts = [(node, 0) for node in sorted(path_nodes) if graph.nodes[node].get("type") == "Part"]
+    visited_parts: set[str] = set()
+    while pending_parts:
+        part, depth = pending_parts.pop(0)
+        if part in visited_parts:
+            continue
+        visited_parts.add(part)
+
+        for source, target in (*graph.in_edges(part), *graph.out_edges(part)):
+            if graph.edges[source, target].get("type") != "REPLACED_BY":
+                selected_edges.add((source, target))
+
+        if depth >= MAX_REPLACEMENT_DEPTH:
+            continue
+        for replacement in sorted(graph.successors(part)):
+            if graph.edges[part, replacement].get("type") != "REPLACED_BY":
                 continue
-            visited_parts.add(part)
-            for replacement in sorted(graph.successors(part)):
-                if graph.edges[part, replacement].get("type") != "REPLACED_BY":
-                    continue
-                selected_edges.add((part, replacement))
-                if graph.nodes[replacement].get("type") == "Part" and replacement not in visited_parts:
-                    pending_parts.append(replacement)
+            selected_edges.add((part, replacement))
+            if graph.nodes[replacement].get("type") == "Part" and replacement not in visited_parts:
+                pending_parts.append((replacement, depth + 1))
 
     edges = sorted(
         selected_edges,
@@ -80,7 +91,7 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             f"-{relation.get('type', 'RELATED_TO')}-> {graph.nodes[target].get('name', target)}"
         )
         numbered_fact = f"{len(facts) + 1}. {fact}"
-        if len("\n".join([*numbered_facts, numbered_fact])) > 8000:
+        if len("\n".join([*numbered_facts, numbered_fact])) > MAX_FACTS_CHARS:
             continue
         facts.append(fact)
         numbered_facts.append(numbered_fact)
@@ -97,9 +108,14 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             {
                 "role": "system",
                 "content": (
-                    "Ты ассистент сервисной службы. Отвечай только по приведённым фактам и не добавляй "
-                    "сведения, которых в них нет. Если данных недостаточно, ответь: «в базе знаний не найдено». "
-                    "Если факты содержат цепочку REPLACED_BY, назови последнюю деталь цепочки как актуальную."
+                    "Ты ассистент сервисной службы. Сначала проверь, дают ли приведённые факты ответ на вопрос. "
+                    "Если ответ следует из фактов, обязательно ответь прямо, не отказывайся излишне осторожно. "
+                    "Направленные связи FIXED_BY, SUPPLIED_BY, BELONGS_TO и REPLACED_BY являются достаточными "
+                    "доказательствами для соответствующих вопросов; используй тип и направление связи, даже если "
+                    "ответ не повторён дословно. Используй также остальные свойства связанных узлов. "
+                    "Если есть REPLACED_BY, проследи цепочку и назови последнюю деталь. "
+                    f"Отказывайся и пиши «{REFUSAL_TEXT}» только если ответ действительно нельзя определить "
+                    "из фактов. Не добавляй отсутствующих в фактах сведений."
                 ),
             },
             {
@@ -116,6 +132,80 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     )
 
 
+def _global_graph_facts(question: str, kb: KnowledgeBase) -> list[str]:
+    """Готовит точные расчёты по имеющимся рёбрам, не достраивая отсутствующие связи."""
+    graph = kb.graph
+    facts: list[str] = []
+    selected_lines = []
+    for kind, name in find_names(question, kb.vocabulary):
+        line = f"ProductLine:{name}"
+        if kind == "ProductLine" and line in graph:
+            selected_lines.append(line)
+    if not selected_lines:
+        selected_lines = sorted(
+            node for node, attrs in graph.nodes(data=True) if attrs.get("type") == "ProductLine"
+        )
+
+    for line in selected_lines:
+        line_name = graph.nodes[line].get("name", line)
+        models = {
+            source
+            for source, _, relation in graph.in_edges(line, data=True)
+            if relation.get("type") == "BELONGS_TO"
+        }
+        failures_by_component: dict[str, int] = {}
+        failures_by_model: dict[str, int] = {}
+        parts: set[str] = set()
+        for model in models:
+            for _, target, relation in graph.out_edges(model, data=True):
+                if relation.get("type") == "FAILED":
+                    weight = relation.get("weight", 1)
+                    failures_by_component[target] = failures_by_component.get(target, 0) + weight
+                    failures_by_model[model] = failures_by_model.get(model, 0) + weight
+                elif relation.get("type") == "HAS_PART":
+                    parts.add(target)
+
+        if failures_by_component:
+            counts = sorted(
+                failures_by_component.items(),
+                key=lambda item: (-item[1], graph.nodes[item[0]].get("name", item[0])),
+            )
+            values = ", ".join(f"{graph.nodes[node].get('name', node)} — {count}" for node, count in counts)
+            facts.append(f"Отказы по узлам линейки «{line_name}»: {values}")
+
+        if failures_by_model:
+            counts = sorted(
+                failures_by_model.items(),
+                key=lambda item: (-item[1], graph.nodes[item[0]].get("name", item[0])),
+            )
+            values = ", ".join(f"{graph.nodes[model].get('name', model)} — {count}" for model, count in counts)
+            facts.append(f"Отказы по моделям линейки «{line_name}»: {values}")
+
+        replaced_parts = []
+        for part in sorted(parts):
+            if any(relation.get("type") == "REPLACED_BY" for _, _, relation in graph.out_edges(part, data=True)):
+                replaced_parts.append(graph.nodes[part].get("name", part))
+        if replaced_parts:
+            facts.append(f"Детали с заменой в линейке «{line_name}»: {', '.join(replaced_parts)}")
+
+    for code in find_codes(question):
+        node = f"{code_type(code)}:{code}"
+        if node not in graph:
+            continue
+        for source, _, relation in graph.in_edges(node, data=True):
+            facts.append(
+                f"{graph.nodes[source].get('name', source)} -{relation.get('type', 'RELATED_TO')}-> "
+                f"{graph.nodes[node].get('name', node)}"
+            )
+        for _, target, relation in graph.out_edges(node, data=True):
+            facts.append(
+                f"{graph.nodes[node].get('name', node)} -{relation.get('type', 'RELATED_TO')}-> "
+                f"{graph.nodes[target].get('name', target)}"
+            )
+
+    return list(dict.fromkeys(facts))
+
+
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Отвечает на обзорный вопрос по сводкам сообществ в два шага.
 
@@ -123,23 +213,33 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
     Если таких ответов нет, возвращается `Answer(..., refused=True)`.
     """
+    codes = find_codes(question)
+    if any(f"{code_type(code)}:{code}" not in kb.graph for code in codes):
+        return Answer(REFUSAL_TEXT, refused=True)
+
     partial_answers: list[str] = []
     sources: list[str] = []
     graph = kb.graph
+    structured_facts = _global_graph_facts(question, kb)
     for community in kb.communities:
+        context = f"Сводка сообщества:\n{community.summary}"
+        if structured_facts:
+            context += "\n\nТочные факты и расчёты по графу, подготовленные кодом:\n"
+            context += "\n".join(f"- {fact}" for fact in structured_facts)
         response = llm.chat(
             [
                 {
                     "role": "system",
                     "content": (
-                        "Ответь на вопрос только по сводке сообщества. Если сводка не помогает ответить, "
-                        "верни пустой ответ и score 0. Иначе дай краткий частичный ответ и оцени его полезность "
-                        "целым числом от 1 до 10."
+                        "Ответь на вопрос только по сводке и точным фактам графа. Рассматривай направленные "
+                        "связи и рассчитанные значения как доказательства; не пересчитывай и не заменяй их "
+                        "приблизительными оценками. Если данные позволяют ответить, верни конкретный частичный "
+                        "ответ и score от 1 до 10. Если данных недостаточно, верни пустой answer и score 0."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": f"Вопрос: {question}\n\nСводка сообщества:\n{community.summary}",
+                    "content": f"Вопрос: {question}\n\n{context}",
                 },
             ],
             json_schema=MAP_SCHEMA,
@@ -162,7 +262,8 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         ):
             continue
 
-        partial_answers.append(answer.strip())
+        if answer.strip() not in partial_answers:
+            partial_answers.append(answer.strip())
         community_nodes = set(community.nodes)
         for source, target, relation in graph.edges(data=True):
             if source not in community_nodes or target not in community_nodes:
@@ -181,13 +282,23 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                 "role": "system",
                 "content": (
                     "Объедини частичные ответы в один точный ответ на вопрос. Используй только сведения из "
-                    "частичных ответов. Если они не дают ответа, напиши: «в базе знаний не найдено»."
+                    "частичных ответов и точных фактов графа ниже. Рассчитанные значения считай точными, "
+                    "не заменяй их предположениями. Если сведений недостаточно, напиши: "
+                    f"«{REFUSAL_TEXT}»."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Вопрос: {question}\n\nПолезные частичные ответы:\n"
+                    f"Вопрос: {question}\n\n"
+                    + (
+                        "Точные факты и расчёты по графу:\n"
+                        + "\n".join(f"- {fact}" for fact in structured_facts)
+                        + "\n\n"
+                        if structured_facts
+                        else ""
+                    )
+                    + "Полезные частичные ответы:\n"
                     + "\n".join(f"{index}. {answer}" for index, answer in enumerate(partial_answers, start=1))
                 ),
             },
@@ -197,5 +308,5 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         reply.content,
         sources=sources,
         facts=partial_answers,
-        refused="в базе знаний не найдено" in reply.content.lower(),
+        refused=REFUSAL_TEXT in reply.content.lower(),
     )

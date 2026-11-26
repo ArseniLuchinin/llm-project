@@ -1,12 +1,12 @@
 """Сообщества графа и их сводки. Требование FR-3."""
 
+from collections import defaultdict
+
 import networkx as nx
 import networkx.algorithms.community as nx_comm
 
-from assistant.infra.llm import LLMClient, LLMResponse, LLMError
+from assistant.infra.llm import LLMClient, LLMError, LLMResponse
 from assistant.infra.schemas import Community
-
-from collections import defaultdict
 
 
 def detect_communities(graph: nx.DiGraph) -> list[Community]:
@@ -73,7 +73,7 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
         node_internal_degree = 0
 
         for u, v in graph.edges(node_id):
-            if not v in internal_nodes:
+            if v not in internal_nodes:
                 continue
 
             e = graph.edges[u, v]
@@ -124,7 +124,7 @@ ID сообщества: {community.community_id}
                 {"role": "user", "content": USER_PROMPT}
             ]
         )
-        return resp.content[:MAX_RESP_LEN]
+        return " ".join(resp.content.split()[:MAX_RESP_LEN])
     except LLMError as err:
         print(f"LLM Client error {err}")
         return ""
