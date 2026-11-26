@@ -1,9 +1,10 @@
 """Сборка графа знаний из результатов извлечения. Требование FR-2."""
 
+from collections import defaultdict
+
 import networkx as nx
 
 from assistant.infra.schemas import ExtractionResult
-from collections import defaultdict
 
 
 def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
