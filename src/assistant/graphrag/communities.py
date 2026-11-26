@@ -124,7 +124,7 @@ ID сообщества: {community.community_id}
                 {"role": "user", "content": USER_PROMPT}
             ]
         )
-        return resp.content[:MAX_RESP_LEN]
+        return " ".join(resp.content.split()[:MAX_RESP_LEN])
     except LLMError as err:
         print(f"LLM Client error {err}")
         return ""
